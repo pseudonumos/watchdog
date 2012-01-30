@@ -1,19 +1,28 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# inotify.py: inotify-based event emitter for Linux 2.6.13+.
 #
-# Copyright (C) 2011 Yesudeep Mangalapilly <yesudeep@gmail.com>
+# Copyright (C) 2010 Sebastien Martini <seb@dbzteam.org>
+# Copyright (C) 2010 Luke McCarthy <luke@iogopro.co.uk>
+# Copyright (C) 2010 Gora Khargosh <gora.khargosh@gmail.com>
+# Copyright (C) 2010 Tim Cuthbertson <tim+github@gfxmonk.net>
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
 
 
 """
@@ -21,7 +30,7 @@
 :synopsis: ``inotify(7)`` based emitter implementation.
 :author: Sebastien Martini <seb@dbzteam.org>
 :author: Luke McCarthy <luke@iogopro.co.uk>
-:author: Yesudeep Mangalapilly <yesudeep@gmail.com>
+:author: Gora Khargosh <gora.khargosh@gmail.com>
 :author: Tim Cuthbertson <tim+github@gfxmonk.net>
 :platforms: Linux 2.6.13+.
 
@@ -72,6 +81,7 @@ from watchdog.utils import platform
 
 if platform.is_linux():
     import os
+    import subprocess
     import struct
     import threading
     import ctypes
@@ -226,16 +236,12 @@ if platform.is_linux():
     # Watchdog's API cares only about these events.
 
     WATCHDOG_ALL_EVENTS = reduce(lambda x, y: x | y, [
-            # We don't actually need IN_CLOSE_NOWRITE, but if it is omitted, 
-            # DELETE_SELF is never emitted.
-            InotifyConstants.IN_CLOSE_NOWRITE,
             InotifyConstants.IN_CLOSE_WRITE,
             InotifyConstants.IN_ATTRIB,
             InotifyConstants.IN_MOVED_FROM,
             InotifyConstants.IN_MOVED_TO,
             InotifyConstants.IN_CREATE,
             InotifyConstants.IN_DELETE,
-            InotifyConstants.IN_DELETE_SELF,
             ])
 
     class InotifyEvent(object):
@@ -303,10 +309,6 @@ if platform.is_linux():
             return self._mask & InotifyConstants.IN_DELETE > 0
 
         @property
-        def is_delete_self(self):
-            return self._mask & InotifyConstants.IN_DELETE_SELF > 0
-
-        @property
         def is_create(self):
             return self._mask & InotifyConstants.IN_CREATE > 0
 
@@ -323,10 +325,6 @@ if platform.is_linux():
             return self._mask & InotifyConstants.IN_MOVE > 0
 
         @property
-        def is_move_self(self):
-            return self._mask & InotifyConstants.IN_MOVE_SELF > 0
-
-        @property
         def is_attrib(self):
             return self._mask & InotifyConstants.IN_ATTRIB > 0
 
@@ -337,11 +335,6 @@ if platform.is_linux():
 
         @property
         def is_directory(self):
-            # It looks like the kernel does not provide this information for 
-            # IN_DELETE_SELF and IN_MOVE_SELF. In this case, assume it's a dir.
-            # See also: https://github.com/seb-m/pyinotify/blob/2c7e8f8/python2/pyinotify.py#L897
-            if self.is_delete_self or self.is_move_self:
-                return True
             return self._mask & InotifyConstants.IN_ISDIR > 0
 
         # Python-specific functionality.
@@ -478,17 +471,27 @@ if platform.is_linux():
             """Clear cached records of MOVED_FROM events"""
             self._moved_from_events = dict()
 
-        def source_for_move(self, destination_event):
-            """
-            The source path corresponding to the given MOVED_TO event.
-
-            If the source path is outside the monitored directories, None
-            is returned instead.
-            """
-            if destination_event.cookie in self._moved_from_events:
-                return self._moved_from_events[destination_event.cookie].src_path
+        def dest_for_move(self, source_event):
+            """Try to find the location of the new file?"""
+            """Uses system command for most recently modified file"""
+            filename = os.path.basename(source_event.src_path)
+            homedir = os.path.expanduser('~')
+            p = subprocess.Popen(['find', homedir, '-name', filename], 
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            output, errors = p.communicate()
+            destinations = output.split('\n')
+            if len(destinations) > 0:
+                return destinations[0]
             else:
-                return None
+                return ''
+
+        def source_for_move(self, destination_event):
+            """The source path corresponding to the given MOVED_TO event"""
+            cookie = destination_event.cookie
+            if cookie in self._moved_from_events:
+                return self._moved_from_events[cookie].src_path
+            else:
+                return ''
 
         def remember_move_from_event(self, event):
             """Save this event as the source event for future MOVED_TO events to reference"""
@@ -771,6 +774,11 @@ if platform.is_linux():
                                     self.queue_event(sub_event)
                         except KeyError:
                             pass
+                    elif event.is_moved_from:
+                        klass = ACTION_EVENT_MAP[(event.is_directory,
+                                                  EVENT_TYPE_MOVED)]
+                        dest_path = self._inotify.dest_for_move(event)
+                        self.queue_event(klass(event.src_path, dest_path))
                     elif event.is_attrib:
                         klass = ACTION_EVENT_MAP[(event.is_directory,
                                                   EVENT_TYPE_MODIFIED)]
@@ -779,7 +787,7 @@ if platform.is_linux():
                         klass = ACTION_EVENT_MAP[(event.is_directory,
                                                   EVENT_TYPE_MODIFIED)]
                         self.queue_event(klass(event.src_path))
-                    elif event.is_delete or event.is_delete_self:
+                    elif event.is_delete:
                         klass = ACTION_EVENT_MAP[(event.is_directory,
                                                   EVENT_TYPE_DELETED)]
                         self.queue_event(klass(event.src_path))
