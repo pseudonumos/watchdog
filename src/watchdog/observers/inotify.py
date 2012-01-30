@@ -497,7 +497,7 @@ if platform.is_linux():
         def source_for_move(self, destination_event):
             """The source path corresponding to the given MOVED_TO event"""
             if destination_event.cookie in self._moved_from_events:
-                return self._moved_from_events[cookie].src_path
+                return self._moved_from_events[destination_event.cookie].src_path
             else:
                 return None
 
